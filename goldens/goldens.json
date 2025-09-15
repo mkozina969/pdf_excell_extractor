@@ -1,0 +1,14 @@
+{
+  "PUT_YOUR_DIESEL_PDF_HERE.pdf": {
+    "expected_count": 525,
+    "must_include_items": []
+  },
+  "PUT_YOUR_NGK_PDF_HERE.pdf": {
+    "expected_count": 141,
+    "must_include_items": []
+  },
+  "PUT_YOUR_BOSCH_PDF_HERE.pdf": {
+    "expected_count": 250,
+    "must_include_items": []
+  }
+}
