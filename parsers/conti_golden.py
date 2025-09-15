@@ -6,9 +6,20 @@ EU_NUM = r"(?:\d{1,3}(?:\.\d{3})*|\d+)(?:,\d+)?"
 EU_RE = re.compile(rf"^{EU_NUM}$")
 
 def _eu_float(s: str) -> float:
+    """Convert European number format to float."""
     return float(s.replace(".", "").replace(",", "."))
 
+
 def parse(full_text: str) -> Tuple[Dict, List[Dict]]:
+    """
+    Parse ContiTech/Continental invoice PDF text content.
+    
+    Args:
+        full_text: Full text content extracted from PDF
+        
+    Returns:
+        Tuple of (header_dict, items_list) containing parsed invoice data
+    """
     header: Dict = {"Supplier": "ContiTech / Continental"}
     items: List[Dict] = []
     if not full_text:
@@ -43,13 +54,16 @@ def parse(full_text: str) -> Tuple[Dict, List[Dict]]:
                     m = re.search(rf"({EU_NUM})\s*EUR", s)
                     if m:
                         unit_price = _eu_float(m.group(1))
-                m2 = re.search(rf"\b([A-Z]{{2,4}})\b.*?({EU_NUM})\s*$", s)
+                m2 = re.search(
+                    rf"\b([A-Z]{{2,4}})\b.*?({EU_NUM})\s*$", s
+                )
                 if m2:
                     if uom is None:
                         uom = m2.group(1)
                     amount = _eu_float(m2.group(2))
 
-            if code and qty is not None and uom and unit_price is not None and amount is not None:
+            if (code and qty is not None and uom and 
+            unit_price is not None and amount is not None):
                 items.append({
                     "Item": code,
                     "Qty": qty,
@@ -63,10 +77,18 @@ def parse(full_text: str) -> Tuple[Dict, List[Dict]]:
         i += 1
 
     # Best-effort header
-    m_no = re.search(r"\b(?:Number|Invoice)\s+([0-9]{5,})\b", full_text, re.I)
-    if m_no: header["Invoice Number"] = m_no.group(1)
-    m_dt = re.search(r"\b(?:Date|Datum)\s*[:#]?\s*([0-9]{2}\.[0-9]{2}\.[0-9]{4})", full_text, re.I)
-    if m_dt: header["Invoice Date"] = m_dt.group(1)
+    m_no = re.search(
+        r"\b(?:Number|Invoice)\s+([0-9]{5,})\b", full_text, re.I
+    )
+    if m_no:
+        header["Invoice Number"] = m_no.group(1)
+    m_dt = re.search(
+        r"\b(?:Date|Datum)\s*[:#]?\s*([0-9]{2}\.[0-9]{2}\.[0-9]{4})",
+        full_text,
+        re.I
+    )
+    if m_dt:
+        header["Invoice Date"] = m_dt.group(1)
     header.setdefault("Currency", "EUR")
 
     return header, items

@@ -6,10 +6,27 @@ from ._common import parse_eu_number, grab, to_erp_item, EU_RE, UOM_RE
 START = re.compile(r"^\s*\d{5,6}\s+\S+")
 
 def parse(full_text: str) -> Tuple[Dict, List[Dict]]:
+    """
+    Parse NGK/Niterra invoice PDF text content.
+    
+    Args:
+        full_text: Full text content extracted from PDF
+        
+    Returns:
+        Tuple of (header_dict, items_list) containing parsed invoice data
+    """
     header: Dict = {
         "Supplier": "NGK / Niterra",
-        "Invoice Number": grab(r"Invoice\s*No\.?\s*([A-Z0-9\-\/]+)", full_text, flags=re.I),
-        "Invoice Date": grab(r"Date\s*([0-9]{2}\.[0-9]{2}\.[0-9]{4})", full_text, flags=re.I),
+        "Invoice Number": grab(
+            r"Invoice\s*No\.?\s*([A-Z0-9\-\/]+)",
+            full_text,
+            flags=re.I
+        ),
+        "Invoice Date": grab(
+            r"Date\s*([0-9]{2}\.[0-9]{2}\.[0-9]{4})",
+            full_text,
+            flags=re.I
+        ),
     }
     items: List[Dict] = []
     for ln in [ln.strip() for ln in full_text.splitlines() if ln.strip()]:
