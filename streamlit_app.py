@@ -1,246 +1,208 @@
 
-import io, json, zipfile
-from pathlib import Path
-import streamlit as st
-import pandas as pd
-
-st.set_page_config(
-    page_title="Invoice PDF -> Excel (PLUS v3.3.20 stable)", 
-    layout="wide"
-)
-
-from parsers import diesel_golden, ngk_golden, bosch_golden, conti_golden
+import io, os, json, zipfile, datetime, traceback
+from typing import Dict, List
+import streamlit as st, pandas as pd
+from openpyxl import load_workbook
+from parsers import diesel_golden, ngk_golden, bosch_golden
 
 PARSERS = {
+    "auto": None,
     "diesel_golden": diesel_golden,
     "ngk_golden": ngk_golden,
     "bosch_golden": bosch_golden,
-    "conti_golden": conti_golden,
 }
 
-def to_xlsx_bytes(header, items) -> bytes:
-    """
-    Convert header and items data to Excel format bytes.
-    
-    Args:
-        header: Dictionary containing header information
-        items: List of dictionaries containing item data
-        
-    Returns:
-        Excel file as bytes
-    """
-    import datetime
-    from openpyxl import load_workbook
-    buf = io.BytesIO()
+EXTRACTORS = ["auto", "pdfplumber", "pypdf", "pymupdf"]
+
+st.set_page_config(page_title="Invoice PDF -> Excel (PLUS v3.3.20 clean)", layout="wide")
+st.title("Invoice PDF -> Excel (PLUS v3.3.20 clean)")
+
+with st.sidebar:
+    override = st.selectbox("Vendor override", list(PARSERS.keys()), index=0)
+    extractor = st.selectbox("Extractor", EXTRACTORS, index=0, help="Pin a specific text extractor if needed.")
+    show_debug = st.checkbox("Show debug (raw text + parsed items)", value=False)
+    st.markdown("---")
+    if st.button("Run self-tests (goldens/)"):
+        st.write("Running golden tests...")
+        results = []
+        try:
+            cfg_path = os.path.join("goldens", "goldens.json")
+            if not os.path.exists(cfg_path):
+                st.warning("goldens/goldens.json not found. Add golden PDFs and config first.")
+            else:
+                with open(cfg_path, "r", encoding="utf-8") as fh:
+                    cfg = json.load(fh)
+                for test in cfg.get("tests", []):
+                    fname = test.get("file")
+                    path = os.path.join("goldens", fname)
+                    if not os.path.exists(path):
+                        results.append((fname, "MISSING_FILE", 0, "File not found"))
+                        continue
+                    with open(path, "rb") as fhpdf:
+                        data = fhpdf.read()
+                    text = st.session_state.get("extract_text_fn", lambda b: "")(data)
+                    parser_key = test.get("override", "")
+                    parser = PARSERS.get(parser_key)
+                    if parser is None:
+                        results.append((fname, "BAD_PARSER", 0, f"Unknown parser {parser_key}"))
+                        continue
+                    header, items = parser.parse(text)
+        # valeo_dual_export
+        packing_rows = []
+        try:
+            if vendor_key == 'valeo_golden':
+                from parsers import valeo_golden as _val
+                packing_rows = _val.parse_packing(text)
+        except Exception as _e:
+            packing_rows = []
+                    ok = True
+                    msg = []
+                    exp = int(test.get("expected_count", 0))
+                    if exp and len(items) != exp:
+                        ok = False; msg.append(f"count {len(items)} != expected {exp}")
+                    must = test.get("must_include_items", [])
+                    if must:
+                        got_items = {str(it.get('Item')) for it in items}
+                        miss = [m for m in must if m not in got_items]
+                        if miss:
+                            ok = False; msg.append(f"missing items {miss}")
+                    results.append((fname, "PASS" if ok else "FAIL", len(items), "; ".join(msg)))
+        except Exception as e:
+            st.error(f"Self-test error: {e}")
+            st.text(traceback.format_exc())
+            results = []
+        if results:
+            df = pd.DataFrame(results, columns=["file","result","parsed_items","notes"])
+            st.dataframe(df, use_container_width=True)
+
+def extract_text(file_bytes: bytes) -> str:
+    # save chosen extractor function in session for self-tests
+    def run_auto(data: bytes) -> str:
+        try:
+            import pdfplumber
+            with pdfplumber.open(io.BytesIO(data)) as pdf:
+                texts = [p.extract_text() or "" for p in pdf.pages]
+            txt = "\n".join(texts)
+            if txt.strip(): return txt
+        except: pass
+        try:
+            from pypdf import PdfReader
+            reader = PdfReader(io.BytesIO(data))
+            texts = [p.extract_text() or "" for p in reader.pages]
+            txt = "\n".join(texts)
+            if txt.strip(): return txt
+        except: pass
+        try:
+            import fitz
+            doc = fitz.open(stream=data, filetype="pdf")
+            texts = [p.get_text("text") or "" for p in doc]
+            return "\n".join(texts)
+        except: return ""
+    def run_pdfplumber(data: bytes) -> str:
+        try:
+            import pdfplumber
+            with pdfplumber.open(io.BytesIO(data)) as pdf:
+                return "\n".join([p.extract_text() or "" for p in pdf.pages])
+        except: return ""
+    def run_pypdf(data: bytes) -> str:
+        try:
+            from pypdf import PdfReader
+            reader = PdfReader(io.BytesIO(data))
+            return "\n".join([p.extract_text() or "" for p in reader.pages])
+        except: return ""
+    def run_pymupdf(data: bytes) -> str:
+        try:
+            import fitz
+            doc = fitz.open(stream=data, filetype="pdf")
+            return "\n".join([p.get_text("text") or "" for p in doc])
+        except: return ""
+
+    table = {
+        "auto": run_auto,
+        "pdfplumber": run_pdfplumber,
+        "pypdf": run_pypdf,
+        "pymupdf": run_pymupdf,
+    }
+    fn = table.get(extractor or "auto", run_auto)
+    st.session_state["extract_text_fn"] = fn
+    return fn(file_bytes)
+
+def parse_dispatch(text: str, override_key: str):
+    if override_key and override_key != "auto":
+        parser = PARSERS[override_key]
+        used = override_key
+        return PARSERS[override_key].parse(text), used
+    used = "auto"
+    if "Diesel Technic" in text:
+        return diesel_golden.parse(text), "diesel_golden"
+    if "NGK" in text or "Niterra" in text:
+        return ngk_golden.parse(text), "ngk_golden"
+    return ({}, []), used
+
+def to_xlsx_bytes(header: Dict, items: List[Dict]) -> bytes:
     hdr = dict(header or {})
     hdr["Parsed on"] = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    with pd.ExcelWriter(buf, engine="openpyxl") as xw:
+    out = io.BytesIO()
+    with pd.ExcelWriter(out, engine="openpyxl") as xw:
         pd.DataFrame([hdr]).to_excel(xw, sheet_name="Header", index=False)
         cols = ["Item", "Qty", "UoM", "Unit Price", "Amount", "VAT"]
         df = pd.DataFrame(items or [], columns=cols)
-        for c in ["Qty", "Unit Price", "Amount"]:
+        # cast numerics and report any NaNs
+        for c in ["Qty","Unit Price","Amount"]:
             df[c] = pd.to_numeric(df[c], errors="coerce")
         df.to_excel(xw, sheet_name="ERP_Import", index=False)
-    buf.seek(0)
-    from openpyxl import load_workbook
-    wb = load_workbook(buf)
-    wb.active = wb["ERP_Import"]
-    out = io.BytesIO()
-    wb.save(out)
     out.seek(0)
-    return out.getvalue()
+    wb = load_workbook(out)
+    wb.active = wb["ERP_Import"]
+    out2 = io.BytesIO()
+    wb.save(out2)
+    return out2.getvalue()
 
-def extract_text_pdfplumber(b: bytes) -> str:
-    """Extract text from PDF using pdfplumber library."""
-    try:
-        import pdfplumber
-        with pdfplumber.open(io.BytesIO(b)) as pdf:
-            return "\\n".join(p.extract_text() or "" for p in pdf.pages)
-    except Exception:
-        return ""
-
-
-def extract_text_pypdf(b: bytes) -> str:
-    """Extract text from PDF using pypdf library."""
-    try:
-        from pypdf import PdfReader
-        reader = PdfReader(io.BytesIO(b))
-        return "\\n".join(p.extract_text() or "" for p in reader.pages)
-    except Exception:
-        return ""
-
-
-def extract_text_pymupdf(b: bytes) -> str:
-    """Extract text from PDF using PyMuPDF library."""
-    try:
-        import fitz
-        doc = fitz.open(stream=b, filetype="pdf")
-        return "\\n".join(page.get_text("text") for page in doc)
-    except Exception:
-        return ""
-
-def extract_text_by_setting(b: bytes, extractor: str) -> str:
-    """
-    Extract text from PDF using specified extractor or auto-detection.
-    
-    Args:
-        b: PDF file as bytes
-        extractor: Name of extractor to use or 'auto'
-        
-    Returns:
-        Extracted text content
-    """
-    if not b:
-        return ""
-    
-    if extractor == "pdfplumber":
-        return extract_text_pdfplumber(b)
-    if extractor == "pypdf":
-        return extract_text_pypdf(b)
-    if extractor == "pymupdf":
-        return extract_text_pymupdf(b)
-    for fn in (extract_text_pdfplumber, extract_text_pypdf, extract_text_pymupdf):
-        t = fn(b)
-        if t.strip():
-            return t
-    return ""
-
-def detect_parser(text: str) -> str:
-    """
-    Detect which parser to use based on text content.
-    
-    Args:
-        text: Text content from PDF
-        
-    Returns:
-        Parser key name
-    """
-    t = (text or "").lower()
-    if "diesel technic" in t:
-        return "diesel_golden"
-    if "niterra" in t or "ngk" in t:
-        return "ngk_golden"
-    if "contitech" in t or "continental" in t:
-        return "conti_golden"
-    if "bosch" in t or "katalo" in t:
-        return "bosch_golden"
-    return "diesel_golden"
-
-def choose_best_bosch_conti(b: bytes, vendor_key: str):
-    """
-    Choose best extractor for Bosch and Continental parsers.
-    
-    Args:
-        b: PDF file as bytes
-        vendor_key: Parser key ('bosch_golden' or 'conti_golden')
-        
-    Returns:
-        Tuple of (extractor_name, text, item_count) or None
-    """
-    if vendor_key not in ("bosch_golden", "conti_golden"):
-        return None
-    if not b:
-        return None
-    
-    texts = {
-        "pdfplumber": extract_text_pdfplumber(b),
-        "pymupdf": extract_text_pymupdf(b)
-    }
-    parser = PARSERS[vendor_key]
-    best = ("", "", 0)
-    for name, txt in texts.items():
-        if not txt.strip():
-            continue
-        try:
-            _, items = parser.parse(txt)
-            n = len(items or [])
-        except Exception:
-            n = 0
-        if n > best[2]:
-            best = (name, txt, n)
-    return best if best[2] > 0 else None
-
-st.sidebar.header("Controls")
-vendor_override = st.sidebar.selectbox(
-    "Vendor override",
-    ["auto", "diesel_golden", "ngk_golden", "bosch_golden", "conti_golden"], 
-    index=0
-)
-extractor = st.sidebar.selectbox(
-    "Extractor",
-    ["auto", "pdfplumber", "pypdf", "pymupdf"],
-    index=0
-)
-show_debug = st.sidebar.checkbox(
-    "Show debug (raw text + parsed items)",
-    value=False
-)
-
-st.title("Invoice PDF -> Excel (PLUS v3.3.20 clean)")
-files = st.file_uploader(
-    "Upload one or more PDF files",
-    type=["pdf"],
-    accept_multiple_files=True
-)
+files = st.file_uploader("Upload one or more PDF files", type=["pdf"], accept_multiple_files=True)
 
 if files:
-    zbuffer = io.BytesIO()
-    zf = zipfile.ZipFile(zbuffer, mode="w", compression=zipfile.ZIP_DEFLATED)
+    zip_buf = io.BytesIO()
+    zf = zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED)
     for f in files:
-        if f is None:
-            st.error("Invalid file uploaded")
-            continue
-            
-        data = f.read()
-        if not data:
-            st.error(f"File {f.name} is empty")
-            continue
-            
-        baseline_text = extract_text_by_setting(
-            data, extractor if extractor != "auto" else "auto"
-        )
-        
-        if not baseline_text.strip():
-            st.warning(f"No text could be extracted from {f.name}")
-            
-        vendor_key = (vendor_override if vendor_override != "auto" 
-                     else detect_parser(baseline_text))
-        chosen_extractor = extractor
-        best = choose_best_bosch_conti(data, vendor_key)
-        text = baseline_text
-        if best:
-            chosen_extractor, text = best[0], best[1]
-        parser = PARSERS.get(vendor_key, diesel_golden)
-        try:
-            header, items = parser.parse(text)
-        except Exception as e:
-            st.error(f"Parser error for {f.name}: {e}")
-            header, items = {}, []
         st.subheader(f.name)
-        st.caption(
-            f"Parser: **{vendor_key}** · Extractor: **{chosen_extractor}** "
-            f"· Parsed items: **{len(items)}**"
-        )
-        st.write("Header")
-        st.dataframe(pd.DataFrame([header]))
-        st.write("ERP_Import")
-        df = pd.DataFrame(items)
-        st.dataframe(df)
-        xbytes = to_xlsx_bytes(header, items)
-        st.download_button(
-            f"⬇️ Download XLSX — {f.name}.xlsx",
-            data=xbytes,
-            file_name=f"{f.name}.xlsx"
-        )
-        zf.writestr(f"{f.name}.xlsx", xbytes)
+        data = f.read()
+        text = extract_text(data)
+        (header, items), used_parser = parse_dispatch(text, override)
+
+        # status line
+        st.markdown(f"**Parser:** `{used_parser}`  •  **Extractor:** `{extractor}`  •  **Parsed items:** **{len(items)}**")
+
+        # preview
+        c1, c2 = st.columns(2)
+        with c1:
+            st.write("Header")
+            st.dataframe(pd.DataFrame([header]) if header else pd.DataFrame(), use_container_width=True)
+        with c2:
+            st.write("ERP_Import")
+            cols = ["Item", "Qty", "UoM", "Unit Price", "Amount", "VAT"]
+            df = pd.DataFrame(items or [], columns=cols)
+            st.dataframe(df, use_container_width=True, height=300)
+
+        # numeric validation
+        if df.shape[0] and df[["Qty","Unit Price","Amount"]].isna().any().any():
+            bad = df[df[["Qty","Unit Price","Amount"]].isna().any(axis=1)]
+            st.warning(f"Found {bad.shape[0]} rows with non-numeric values in Qty/Unit Price/Amount. Check debug.")
         if show_debug:
-            st.write("Debug (first 200 lines)")
-            st.text("\\n".join((text or "").splitlines()[:200]))
+            st.write("Debug (raw text first 200 lines)")
+            st.text("\n".join((text or "").splitlines()[:200]))
+
+        xbytes = to_xlsx_bytes(header, items)
+        st.download_button(f"⬇️ Download XLSX — {f.name}.xlsx", data=xbytes, file_name=f"{f.name}.xlsx")
+        zf.writestr(f"{f.name}.xlsx", xbytes)
+        if vendor_key == "valeo_golden" and (packing_rows is not None):
+            import io
+            from openpyxl import Workbook
+            wb = Workbook(); ws = wb.active; ws.title = "PackingList"
+            ws.append(["Parcel N°","Valeo Material N","Quantity"])
+            for r in (packing_rows or []): ws.append([r.get("Parcel N°"), r.get("Valeo Material N"), r.get("Quantity")])
+            buf = io.BytesIO(); wb.save(buf); buf.seek(0)
+            zf.writestr(f"{f.name}_packing.xlsx", buf.getvalue())
     zf.close()
-    st.download_button(
-        "📦 Download all as ZIP",
-        data=zbuffer.getvalue(),
-        file_name="converted_invoices.zip"
-    )
+    st.download_button("📦 Download all as ZIP", data=zip_buf.getvalue(), file_name="converted_invoices.zip")
 else:
-    st.info("Upload one or more PDFs.")
+    st.info("Upload PDF invoices to convert them. For regression checks, put samples into ./goldens and click 'Run self-tests' in the sidebar.")
